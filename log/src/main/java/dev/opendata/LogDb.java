@@ -2,30 +2,25 @@ package dev.opendata;
 
 import dev.opendata.common.AppendTimeoutException;
 import dev.opendata.common.QueueFullException;
+import dev.opendata.common.StorageConfig;
 
 import java.io.Closeable;
-import java.util.List;
 
 /**
  * Java binding for the OpenData LogDb trait.
  *
- * <p>Provides append-only log operations backed by a native Rust implementation.
- * This is a thin wrapper over the native layer - callers are responsible for
- * batching and backpressure.
+ * <p>Provides append-only log operations backed by a native C implementation
+ * via Panama FFM. This is a thin wrapper over the native layer - callers are
+ * responsible for batching and backpressure.
  *
  * <p>Implements {@link LogRead} for read operations. For read-only access without
  * write capabilities, use {@link LogDbReader} instead.
  */
 public class LogDb implements Closeable, LogRead {
 
-    static {
-        System.loadLibrary("opendata_log_jni");
-    }
+    private final NativeInterop.LogHandle handle;
 
-    private final long handle;
-    private volatile boolean closed = false;
-
-    private LogDb(long handle) {
+    private LogDb(NativeInterop.LogHandle handle) {
         this.handle = handle;
     }
 
@@ -39,11 +34,28 @@ public class LogDb implements Closeable, LogRead {
         if (config == null) {
             throw new IllegalArgumentException("config must not be null");
         }
-        long handle = nativeCreate(config);
-        if (handle == 0) {
-            throw new RuntimeException("Failed to create LogDb instance");
+
+        StorageConfig storage = config.storage();
+        long sealIntervalMs = config.segmentation().sealIntervalMs() != null
+                ? config.segmentation().sealIntervalMs()
+                : -1;
+
+        switch (storage) {
+            case StorageConfig.InMemory() -> {
+                try (NativeInterop.ObjectStoreHandle objectStore = NativeInterop.objectStoreInMemory()) {
+                    NativeInterop.LogHandle logHandle = NativeInterop.logOpen(
+                            0, null, objectStore.segment(), null, sealIntervalMs);
+                    return new LogDb(logHandle);
+                }
+            }
+            case StorageConfig.SlateDb slateDb -> {
+                try (NativeInterop.ObjectStoreHandle objectStore = NativeInterop.resolveObjectStore(slateDb.objectStore())) {
+                    NativeInterop.LogHandle logHandle = NativeInterop.logOpen(
+                            1, slateDb.path(), objectStore.segment(), slateDb.settingsPath(), sealIntervalMs);
+                    return new LogDb(logHandle);
+                }
+            }
         }
-        return new LogDb(handle);
     }
 
     /**
@@ -67,7 +79,21 @@ public class LogDb implements Closeable, LogRead {
      */
     public AppendResult tryAppend(Record[] records) {
         checkNotClosed();
-        return nativeTryAppend(handle, records);
+        return NativeInterop.logTryAppend(handle, records);
+    }
+
+    /**
+     * Appends a pre-built {@link RecordBatch} without blocking for queue space.
+     *
+     * <p>The batch is not closed by this method — the caller retains ownership.
+     *
+     * @param batch the record batch to append
+     * @return the result of the append operation (sequence of first record)
+     * @throws QueueFullException if the write queue is full
+     */
+    public AppendResult tryAppend(RecordBatch batch) {
+        checkNotClosed();
+        return NativeInterop.logTryAppend(handle, batch);
     }
 
     /**
@@ -100,7 +126,23 @@ public class LogDb implements Closeable, LogRead {
      */
     public AppendResult appendTimeout(Record[] records, long timeoutMs) {
         checkNotClosed();
-        return nativeAppendTimeout(handle, records, timeoutMs);
+        return NativeInterop.logAppendTimeout(handle, records, timeoutMs);
+    }
+
+    /**
+     * Appends a pre-built {@link RecordBatch}, blocking up to {@code timeoutMs} for queue space.
+     *
+     * <p>The batch is not closed by this method — the caller retains ownership.
+     *
+     * @param batch     the record batch to append
+     * @param timeoutMs maximum time to wait in milliseconds
+     * @return the result of the append operation (sequence of first record)
+     * @throws AppendTimeoutException if the timeout expires before queue space is available
+     * @throws QueueFullException     if the write queue is full (unlikely with timeout)
+     */
+    public AppendResult appendTimeout(RecordBatch batch, long timeoutMs) {
+        checkNotClosed();
+        return NativeInterop.logAppendTimeout(handle, batch, timeoutMs);
     }
 
     /**
@@ -118,10 +160,9 @@ public class LogDb implements Closeable, LogRead {
     }
 
     @Override
-    public List<LogEntry> scan(byte[] key, long startSequence, int maxEntries) {
+    public LogScanRawIterator scanRaw(byte[] key, long startSequence) {
         checkNotClosed();
-        LogEntry[] entries = nativeScan(handle, key, startSequence, maxEntries);
-        return entries != null ? List.of(entries) : List.of();
+        return new LogScanRawIterator(NativeInterop.logScan(handle, key, startSequence));
     }
 
     /**
@@ -133,32 +174,17 @@ public class LogDb implements Closeable, LogRead {
      */
     public void flush() {
         checkNotClosed();
-        nativeFlush(handle);
+        NativeInterop.logFlush(handle);
     }
 
     @Override
     public void close() {
-        if (!closed) {
-            closed = true;
-            nativeClose(handle);
-        }
+        handle.close();
     }
 
     private void checkNotClosed() {
-        if (closed) {
+        if (handle.isClosed()) {
             throw new IllegalStateException("LogDb is closed");
         }
     }
-
-    long getHandle() {
-        return handle;
-    }
-
-    // Native methods
-    private static native long nativeCreate(LogDbConfig config);
-    private static native AppendResult nativeTryAppend(long handle, Record[] records);
-    private static native AppendResult nativeAppendTimeout(long handle, Record[] records, long timeoutMs);
-    private static native LogEntry[] nativeScan(long handle, byte[] key, long startSequence, long maxEntries);
-    private static native void nativeFlush(long handle);
-    private static native void nativeClose(long handle);
 }
