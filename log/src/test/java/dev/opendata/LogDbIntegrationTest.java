@@ -661,6 +661,54 @@ class LogDbIntegrationTest {
     }
 
     @Test
+    void shouldSeeDataAfterFlushWithRemoteVisibility(@TempDir Path tempDir) {
+        var storage = new StorageConfig.SlateDb(
+                "visibility-remote-test",
+                new ObjectStoreConfig.Local(tempDir.toString())
+        );
+        var config = new LogDbConfig(storage, SegmentConfig.DEFAULT, ReadVisibility.REMOTE);
+
+        byte[] key = "remote-vis-key".getBytes(StandardCharsets.UTF_8);
+
+        try (LogDb log = LogDb.open(config)) {
+            log.tryAppend(key, "value-0".getBytes(StandardCharsets.UTF_8));
+            log.tryAppend(key, "value-1".getBytes(StandardCharsets.UTF_8));
+
+            // Flush ensures data is durable — should be visible with REMOTE visibility
+            log.flush();
+
+            try (LogScanIterator iter = log.scan(key, 0)) {
+                List<LogEntry> entries = collect(iter);
+                assertThat(entries).hasSize(2);
+                assertThat(new String(entries.get(0).value(), StandardCharsets.UTF_8)).isEqualTo("value-0");
+                assertThat(new String(entries.get(1).value(), StandardCharsets.UTF_8)).isEqualTo("value-1");
+            }
+        }
+    }
+
+    @Test
+    void shouldSeeUnflushedWritesWithMemoryVisibility(@TempDir Path tempDir) {
+        var storage = new StorageConfig.SlateDb(
+                "visibility-memory-test",
+                new ObjectStoreConfig.Local(tempDir.toString())
+        );
+        var config = new LogDbConfig(storage, SegmentConfig.DEFAULT, ReadVisibility.MEMORY);
+
+        byte[] key = "memory-vis-key".getBytes(StandardCharsets.UTF_8);
+
+        try (LogDb log = LogDb.open(config)) {
+            log.tryAppend(key, "value-0".getBytes(StandardCharsets.UTF_8));
+
+            // Data is written to memory — should be visible even without flush
+            try (LogScanIterator iter = log.scan(key, 0)) {
+                List<LogEntry> entries = collect(iter);
+                assertThat(entries).hasSize(1);
+                assertThat(new String(entries.get(0).value(), StandardCharsets.UTF_8)).isEqualTo("value-0");
+            }
+        }
+    }
+
+    @Test
     void shouldReturnSameResultForRepeatedHasNext() {
         try (LogDb log = LogDb.openInMemory()) {
             byte[] key = "idempotent-key".getBytes(StandardCharsets.UTF_8);
